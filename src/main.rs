@@ -2,8 +2,21 @@ extern crate chrono;
 extern crate clap;
 extern crate reqwest;
 extern crate scraper;
+extern crate serde;
+#[macro_use]
+extern crate serde_derive;
+extern crate serde_json;
+extern crate uuid;
 
 use clap::{App, Arg};
+
+#[derive(Serialize, Deserialize)]
+struct Data {
+    local_account_number: String,
+    amount: String,
+    currency: String,
+    timestamp: i64,
+}
 
 fn main() {
     let matches = app().get_matches();
@@ -16,18 +29,23 @@ fn main() {
     };
     let local_account_number = matches.value_of("account_number").unwrap();
     let now = chrono::Utc::now();
-    let data = format!(
-        "balance,localAccountNumber={} balance={},currency=\"{}\" {}000000000",
-        local_account_number,
-        amount,
-        currency,
-        now.timestamp()
-    );
-    let host = matches.value_of("influx_host").unwrap();
-    let port = matches.value_of("influx_port").unwrap();
-    let database = matches.value_of("influx_database").unwrap();
-    if let Err(err) = post_data_to_influxdb(host, port, database, &data) {
-        println!("Error posting data to InfluxDB: {}", err)
+    let data = Data {
+        local_account_number: local_account_number.to_owned(),
+        amount: amount,
+        currency: currency,
+        timestamp: now.timestamp(),
+    };
+    let host = matches.value_of("database_host").unwrap();
+    let port = matches.value_of("database_port").unwrap();
+    let database_name = matches.value_of("database_name").unwrap();
+    if matches.value_of("database_type").unwrap() == "influxdb" {
+        if let Err(err) = post_data_to_influxdb(host, port, database_name, &data) {
+            println!("Error posting data to InfluxDB: {}", err)
+        }
+    } else {
+        if let Err(err) = post_data_to_couchdb(host, port, database_name, &data) {
+            println!("Error posting data to CouchDB: {}", err)
+        }
     }
 }
 
@@ -61,15 +79,50 @@ fn fetch_balance(id: &str, pin: &str, state: &str) -> Result<(String, String), S
     Ok((amount.to_owned(), currency.to_owned()))
 }
 
-fn post_data_to_influxdb(host: &str, port: &str, database: &str, data: &str) -> Result<(), String> {
+fn post_data_to_influxdb(
+    host: &str,
+    port: &str,
+    database: &str,
+    data: &Data,
+) -> Result<(), String> {
+    let payload = format!(
+        "balance,localAccountNumber={} balance={},currency=\"{}\" {}000000000",
+        data.local_account_number, data.amount, data.currency, data.timestamp
+    );
     let url = format!("http://{}:{}/write?db={}", host, port, database);
     let client = reqwest::Client::new();
-    let _resp = client
+    client
         .post(&url)
-        .body(data.to_owned())
+        .body(payload.to_owned())
         .send()
-        .map_err(|err| format!("Failed to POST to influxdb: {}", err))?;
-    Ok(())
+        .and_then(|mut resp| {
+            print!("{}", resp.text().unwrap());
+            if resp.status().is_success() {
+                Ok(())
+            } else {
+                resp.error_for_status().map(|_| ())
+            }
+        })
+        .map_err(|err| format!("Failed to POST to influxdb: {}", err))
+}
+
+fn post_data_to_couchdb(host: &str, port: &str, database: &str, data: &Data) -> Result<(), String> {
+    let uuid = uuid::Uuid::new_v4();
+    let url = format!("http://{}:{}/{}/{}", host, port, database, uuid);
+    let client = reqwest::Client::new();
+    client
+        .put(&url)
+        .body(serde_json::to_string(data).unwrap())
+        .send()
+        .and_then(|mut resp| {
+            print!("{}", resp.text().unwrap());
+            if resp.status().is_success() {
+                Ok(())
+            } else {
+                resp.error_for_status().map(|_| ())
+            }
+        })
+        .map_err(|err| format!("Failed to PUT new document into couchdb: {}", err))
 }
 
 fn app() -> App<'static, 'static> {
@@ -107,29 +160,43 @@ fn app() -> App<'static, 'static> {
                 .long("state")
                 .help("The state of the LBS, i.e. bw, nw.")
                 .takes_value(true)
-                .required(true),
+                .required(true)
+                .possible_values(&["bw", "nw"]),
         )
         .arg(
-            Arg::with_name("influx_host")
+            Arg::with_name("database_type")
+                .short("t")
+                .long("database_type")
+                .help("The type of database to use.")
+                .takes_value(true)
+                .default_value("influxdb")
+                .possible_values(&["influxdb", "couchdb"]),
+        )
+        .arg(
+            Arg::with_name("database_host")
                 .short("h")
                 .long("host")
-                .help("The host name of the InfluxDB.")
+                .help("The host name of the database.")
                 .takes_value(true)
                 .default_value("localhost"),
         )
         .arg(
-            Arg::with_name("influx_port")
+            Arg::with_name("database_port")
                 .short("p")
                 .long("port")
-                .help("The port of the InfluxDB.")
+                .help("The port of the database.")
                 .takes_value(true)
-                .default_value("8086"),
+                .required(true)
+                .default_value_ifs(&[
+                    ("database_type", Some("influxdb"), "8086"),
+                    ("database_type", Some("couchdb"), "5984"),
+                ]),
         )
         .arg(
-            Arg::with_name("influx_database")
+            Arg::with_name("database_name")
                 .short("d")
                 .long("database")
-                .help("The InfluxDB database to write the value to")
+                .help("The database name to write the values to.")
                 .takes_value(true)
                 .required(true),
         )
